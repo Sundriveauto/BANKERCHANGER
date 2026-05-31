@@ -3,6 +3,7 @@ import pinoHttp from "pino-http";
 import { validateEnv } from "./config/env";
 import { setupSwagger } from "./config/swagger";
 import { errorMiddleware } from "./middleware/error.middleware";
+import { initSentry, applySentryRequestHandler } from "./middleware/sentry.middleware";
 import { rateLimit } from "./middleware/rate-limit.middleware";
 import { requestLogging } from "./middleware/request-logging.middleware";
 import { AppError } from "./utils/AppError";
@@ -10,10 +11,15 @@ import { logger } from "./utils/logger";
 import authRouter from "./routes/auth.routes";
 import marketRouter from "./routes/market.routes";
 import adminRouter from "./routes/admin.routes";
-import { getPortfolio, getBetsByAddress, getPlatformStats } from "./api/controllers/MarketController";
+import { getPortfolio, getPlatformStats } from "./api/controllers/MarketController";
+import claimsRouter from "./routes/bet.routes";
+import { startAutoResolutionCron, startAutoLockCron } from "./cron/autoResolution.cron";
 
 // Validate environment variables on startup
 const env = validateEnv();
+
+// Initialise Sentry before any other code (captures unhandled rejections/exceptions)
+initSentry(env.SENTRY_DSN, env.NODE_ENV);
 
 const app = express();
 
@@ -45,9 +51,10 @@ app.use(
 
 app.use("/auth", authRouter);
 app.use("/api/markets", marketRouter);
+app.use("/api/claims", claimsRouter);
 app.get("/api/stats", getPlatformStats);
 app.get("/api/portfolio/:address", getPortfolio);
-app.get("/api/bets/:bettor_address", getBetsByAddress);
+app.use("/api/bets", claimsRouter);
 app.use("/api/admin", adminRouter);
 app.post("/trading/bet", (_req, res) => res.json({ ok: true }));
 app.post("/wallet/withdraw", (_req, res) => res.json({ ok: true }));
@@ -80,6 +87,9 @@ app.use((_req, _res, next) => {
   next(AppError.notFound("Route not found"));
 });
 
+// Sentry error handler - must be before errorMiddleware
+applySentryRequestHandler(app);
+
 // Error handler - must be LAST
 app.use(errorMiddleware);
 
@@ -89,6 +99,8 @@ app.listen(PORT, () => {
   if (env.NODE_ENV === 'development') {
     logger.info(`Swagger UI available at http://localhost:${PORT}/api/docs`);
   }
+  startAutoResolutionCron();
+  startAutoLockCron();
 });
 
 export default app;

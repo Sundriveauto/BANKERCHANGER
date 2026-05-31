@@ -7,7 +7,7 @@
 import type { Market, MarketStats, PlatformStats } from '../models/Market';
 import type { Bet } from '../models/Bet';
 import { pool } from '../config/db';
-import { cacheGet, cacheSet } from './cache.service';
+import { cacheGet, cacheSet, cacheDelete, cacheDeletePattern } from './cache.service';
 import * as StellarService from './StellarService';
 import { AppError } from '../utils/AppError';
 
@@ -38,6 +38,9 @@ export { db };
 export interface MarketFilters {
   status?: string;
   weight_class?: string;
+  fighter?: string;
+  dateFrom?: Date;
+  dateTo?: Date;
 }
 
 export interface Pagination {
@@ -60,6 +63,22 @@ export interface MarketWithOdds extends Market {
   odds: MarketOdds;
 }
 
+export interface OutcomeOdds {
+  outcome: string;
+  multiplier: number;
+  implied_probability: number;
+  pool: string;
+  total_pool: string;
+}
+
+export interface AllOutcomeOdds {
+  market_id: string;
+  fighter_a: OutcomeOdds;
+  fighter_b: OutcomeOdds;
+  draw: OutcomeOdds;
+  total_pool: string;
+}
+
 export interface Portfolio {
   address: string;
   active_bets: Bet[];
@@ -70,15 +89,20 @@ export interface Portfolio {
   pending_claims: Bet[];
 }
 
+export interface ProjectedPayout {
+  amount: string;
+  formatted_xlm: number;
+}
+
 /**
  * Returns paginated markets from the database.
  *
  * Steps:
- *   1. Build WHERE clause from filters (status, weight_class)
+ *   1. Build WHERE clause from filters (status, weight_class, fighter name, date range)
  *   2. Apply pagination (LIMIT / OFFSET)
  *   3. Check Redis cache — return cached result if fresh (TTL 30s)
  *   4. Query DB if cache miss; store result in cache before returning
- *   5. Sort by scheduled_at ASC by default
+ *   5. Sort by scheduled_at DESC by default
  */
 export async function getMarkets(
   filters?: MarketFilters,
@@ -86,9 +110,12 @@ export async function getMarkets(
 ): Promise<MarketListResult> {
   const statusKey = filters?.status ?? '';
   const weightKey = filters?.weight_class ?? '';
+  const fighterKey = filters?.fighter ?? '';
+  const dateFromKey = filters?.dateFrom?.toISOString() ?? '';
+  const dateToKey = filters?.dateTo?.toISOString() ?? '';
   const page = pagination?.page ?? 1;
   const limit = pagination?.limit ?? 50;
-  const cacheKey = `markets:${statusKey}:${weightKey}:${page}:${limit}`;
+  const cacheKey = `markets:${statusKey}:${weightKey}:${fighterKey}:${dateFromKey}:${dateToKey}:${page}:${limit}`;
   const cached = await cacheGet<MarketListResult>(cacheKey);
   if (cached) return cached;
 
@@ -98,11 +125,20 @@ export async function getMarkets(
     const filtered = markets.filter((market) => {
       if (filters?.status && market.status !== filters.status) return false;
       if (filters?.weight_class && market.weight_class !== filters.weight_class) return false;
+      if (filters?.fighter) {
+        const fighterLower = filters.fighter.toLowerCase();
+        if (!market.fighter_a.toLowerCase().includes(fighterLower) && 
+            !market.fighter_b.toLowerCase().includes(fighterLower)) {
+          return false;
+        }
+      }
+      if (filters?.dateFrom && new Date(market.scheduled_at) < filters.dateFrom) return false;
+      if (filters?.dateTo && new Date(market.scheduled_at) > filters.dateTo) return false;
       return true;
     });
 
     const sorted = [...filtered].sort(
-      (a, b) => new Date(a.scheduled_at).getTime() - new Date(b.scheduled_at).getTime(),
+      (a, b) => new Date(b.scheduled_at).getTime() - new Date(a.scheduled_at).getTime(),
     );
 
     const offset = (page - 1) * limit;
@@ -120,12 +156,24 @@ export async function getMarkets(
       values.push(filters.weight_class);
       whereClauses.push(`weight_class = $${values.length}`);
     }
+    if (filters?.fighter) {
+      values.push(`%${filters.fighter}%`);
+      whereClauses.push(`(fighter_a ILIKE $${values.length} OR fighter_b ILIKE $${values.length})`);
+    }
+    if (filters?.dateFrom) {
+      values.push(filters.dateFrom);
+      whereClauses.push(`scheduled_at >= $${values.length}`);
+    }
+    if (filters?.dateTo) {
+      values.push(filters.dateTo);
+      whereClauses.push(`scheduled_at <= $${values.length}`);
+    }
 
     const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
     const offset = (page - 1) * limit;
 
     const rows = await pool.query(
-      `SELECT * FROM markets ${whereSql} ORDER BY scheduled_at ASC LIMIT $${values.length + 1} OFFSET $${values.length + 2}`,
+      `SELECT * FROM markets ${whereSql} ORDER BY scheduled_at DESC LIMIT $${values.length + 1} OFFSET $${values.length + 2}`,
       [...values, limit, offset],
     );
 
@@ -148,6 +196,16 @@ export async function getMarkets(
 
   await cacheSet(cacheKey, result, 30);
   return result;
+}
+
+/**
+ * Invalidates cache for a market when it's updated.
+ * Clears the market cache and related pattern caches.
+ */
+export async function invalidateMarketCache(market_id: string): Promise<void> {
+  await cacheDelete(`market:${market_id}`);
+  await cacheDeletePattern(`markets:*`);
+  await cacheDelete(`market:${market_id}:stats`);
 }
 
 /**
@@ -212,6 +270,116 @@ export async function getMarketOdds(market_id: string): Promise<MarketOdds> {
     odds_a: Number(pool_a * 10000n / total_pool),
     odds_b: Number(pool_b * 10000n / total_pool),
     odds_draw: Number(pool_draw * 10000n / total_pool),
+  };
+}
+
+/**
+ * Calculates parimutuel odds for a market.
+ * 
+ * Formula: odds_x = total_pool / outcome_pool
+ * Returns all three odds as floats rounded to 2 decimal places.
+ * Returns { fighterA: 0, fighterB: 0, draw: 0 } for empty pools.
+ */
+export async function calculateOdds(market_id: string): Promise<{ fighterA: number; fighterB: number; draw: number }> {
+  const market = await db().findMarketById(market_id);
+  if (!market) throw AppError.notFound(`Market not found: ${market_id}`);
+
+  const total_pool = BigInt(market.total_pool);
+  const pool_a = BigInt(market.pool_a);
+  const pool_b = BigInt(market.pool_b);
+  const pool_draw = BigInt(market.pool_draw);
+
+  if (total_pool === 0n) {
+    return { fighterA: 0, fighterB: 0, draw: 0 };
+  }
+
+  const fighterA = pool_a === 0n ? 0 : Number((total_pool * 100n) / pool_a) / 100;
+  const fighterB = pool_b === 0n ? 0 : Number((total_pool * 100n) / pool_b) / 100;
+  const draw = pool_draw === 0n ? 0 : Number((total_pool * 100n) / pool_draw) / 100;
+
+  return {
+    fighterA: Math.round(fighterA * 100) / 100,
+    fighterB: Math.round(fighterB * 100) / 100,
+    draw: Math.round(draw * 100) / 100,
+  };
+}
+
+/** Shared pool loader for odds calculations. */
+async function loadMarketPools(market_id: string) {
+  const market = await db().findMarketById(market_id);
+  if (!market) throw AppError.notFound(`Market not found: ${market_id}`);
+  return {
+    totalPool: BigInt(market.total_pool),
+    poolA: BigInt(market.pool_a),
+    poolB: BigInt(market.pool_b),
+    poolDraw: BigInt(market.pool_draw),
+    feeBps: BigInt(market.fee_bps),
+    totalPoolStr: market.total_pool,
+  };
+}
+
+/** Build an OutcomeOdds from raw pool values. */
+function computeOutcomeOdds(
+  pool: bigint,
+  totalPool: bigint,
+  feeBps: bigint,
+  outcome: string,
+  totalPoolStr: string,
+): OutcomeOdds {
+  if (totalPool === 0n || pool === 0n) {
+    return { outcome, multiplier: 0, implied_probability: 0, pool: pool.toString(), total_pool: totalPoolStr };
+  }
+  const fee = (totalPool * feeBps) / 10000n;
+  const netPool = totalPool - fee;
+  const multiplier = Number((netPool * 10000n) / pool) / 10000;
+  const implied_probability = Number((pool * 10000n) / totalPool) / 100;
+  return {
+    outcome,
+    multiplier: Math.round(multiplier * 100) / 100,
+    implied_probability: Math.round(implied_probability * 100) / 100,
+    pool: pool.toString(),
+    total_pool: totalPoolStr,
+  };
+}
+
+/**
+ * Calculates parimutuel odds for a single specific outcome.
+ *
+ * Parimutuel formula:
+ *   multiplier = (total_pool - fee) / outcome_pool
+ *   implied_probability = outcome_pool / total_pool
+ *
+ * Returns zero multiplier/probability for empty pools.
+ */
+export async function calculateSingleOutcomeOdds(
+  market_id: string,
+  outcome: 'fighter_a' | 'fighter_b' | 'draw',
+): Promise<OutcomeOdds> {
+  const { totalPool, poolA, poolB, poolDraw, feeBps, totalPoolStr } = await loadMarketPools(market_id);
+  const pool = outcome === 'fighter_a' ? poolA : outcome === 'fighter_b' ? poolB : poolDraw;
+  return computeOutcomeOdds(pool, totalPool, feeBps, outcome, totalPoolStr);
+}
+
+/**
+ * Calculates parimutuel odds for all three outcomes.
+ *
+ * Parimutuel formula (per outcome):
+ *   multiplier = (total_pool - fee) / outcome_pool
+ *   implied_probability = outcome_pool / total_pool
+ *
+ * Returns zeros for outcomes with empty pools.
+ */
+export async function calculateOutcomeOdds(
+  market_id: string,
+): Promise<AllOutcomeOdds> {
+  const { totalPool, poolA, poolB, poolDraw, feeBps, totalPoolStr } = await loadMarketPools(market_id);
+
+  return {
+    market_id,
+    fighter_a: computeOutcomeOdds(poolA, totalPool, feeBps, 'fighter_a', totalPoolStr),
+    fighter_b: computeOutcomeOdds(poolB, totalPool, feeBps, 'fighter_b', totalPoolStr),
+    draw: computeOutcomeOdds(poolDraw, totalPool, feeBps, 'draw', totalPoolStr),
+    total_pool: totalPoolStr,
   };
 }
 
@@ -351,23 +519,55 @@ export async function getPortfolioByAddress(
 }
 
 /**
- * Returns all bets placed by a given Stellar address across all markets.
- * Returns an empty array (never 404) when the address has no bets.
+ * Simulates projected payout for a hypothetical bet on a market.
+ *
+ * Parimutuel formula:
+ *   payout = (hypothetical_amount / outcome_pool) * (total_pool - fee)
+ *
+ * Returns zero if the outcome pool is empty or the market is cancelled.
  */
-export async function getBetsByAddress(bettor_address: string): Promise<Bet[]> {
-  if (_db) {
-    return db().findBetsByAddress(bettor_address);
+export async function simulateProjectedPayout(
+  market_id: string,
+  amount: string,
+  outcome: 'fighter_a' | 'fighter_b' | 'draw',
+): Promise<ProjectedPayout> {
+  const market = await db().findMarketById(market_id);
+  if (!market) throw AppError.notFound(`Market not found: ${market_id}`);
+
+  if (market.status === 'cancelled') {
+    return { amount: '0', formatted_xlm: 0 };
   }
 
-  const { rows } = await pool.query(
-    'SELECT * FROM bets WHERE bettor_address = $1 ORDER BY placed_at DESC',
-    [bettor_address],
-  );
-  return rows.map((row) => ({
-    ...row,
-    placed_at: new Date(row.placed_at),
-    claimed_at: row.claimed_at ? new Date(row.claimed_at) : null,
-  } as Bet));
+  const betAmount = BigInt(amount);
+  if (betAmount <= 0n) {
+    return { amount: '0', formatted_xlm: 0 };
+  }
+
+  const total_pool = BigInt(market.total_pool);
+  const fee_bps = market.fee_bps;
+  const fee = (total_pool * BigInt(fee_bps)) / 10000n;
+  const pool_after_fee = total_pool - fee;
+
+  let winning_pool: bigint;
+  if (outcome === 'fighter_a') {
+    winning_pool = BigInt(market.pool_a);
+  } else if (outcome === 'fighter_b') {
+    winning_pool = BigInt(market.pool_b);
+  } else {
+    winning_pool = BigInt(market.pool_draw);
+  }
+
+  if (winning_pool <= 0n) {
+    return { amount: '0', formatted_xlm: 0 };
+  }
+
+  const payout = (betAmount * pool_after_fee) / winning_pool;
+  const formatted_xlm = Number(payout) / 10_000_000;
+
+  return {
+    amount: payout.toString(),
+    formatted_xlm,
+  };
 }
 
 /**
@@ -419,4 +619,93 @@ export async function getPlatformStats(): Promise<PlatformStats> {
 
   await cacheSet(cacheKey, stats, 60);
   return stats;
+}
+
+// ---------------------------------------------------------------------------
+// Bulk operations
+// ---------------------------------------------------------------------------
+
+export interface BulkResult {
+  succeeded: string[];
+  failed: { id: string; reason: string }[];
+}
+
+/**
+ * Pauses (locks) up to 50 open markets in a single admin action.
+ * Each market is processed independently — failures do not abort others.
+ */
+export async function bulkPauseMarkets(marketIds: string[]): Promise<BulkResult> {
+  const result: BulkResult = { succeeded: [], failed: [] };
+
+  for (const id of marketIds) {
+    try {
+      const { rows } = await pool.query(
+        `UPDATE markets SET status = 'locked', updated_at = NOW()
+         WHERE market_id = $1 AND status = 'open'
+         RETURNING market_id`,
+        [id],
+      );
+      if (rows.length === 0) {
+        result.failed.push({ id, reason: 'Market not found or not in open status' });
+      } else {
+        await invalidateMarketCache(id);
+        result.succeeded.push(id);
+      }
+    } catch (err) {
+      result.failed.push({ id, reason: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Cancels up to 50 open/locked markets and enqueues notifications for all
+ * position holders of each successfully cancelled market.
+ * Each market is processed independently — failures do not abort others.
+ */
+export async function bulkCancelMarkets(
+  marketIds: string[],
+  reason: string,
+): Promise<BulkResult> {
+  const result: BulkResult = { succeeded: [], failed: [] };
+
+  for (const id of marketIds) {
+    try {
+      const { rows } = await pool.query(
+        `UPDATE markets SET status = 'cancelled', updated_at = NOW()
+         WHERE market_id = $1 AND status IN ('open', 'locked')
+         RETURNING market_id`,
+        [id],
+      );
+      if (rows.length === 0) {
+        result.failed.push({ id, reason: 'Market not found or not cancellable' });
+        continue;
+      }
+
+      await invalidateMarketCache(id);
+
+      // Enqueue notifications for all position holders
+      const bettors = await pool.query(
+        `SELECT DISTINCT bettor_address FROM bets WHERE market_id = $1`,
+        [id],
+      );
+      if (bettors.rows.length > 0) {
+        const values = bettors.rows
+          .map((_: unknown, i: number) => `($${i * 4 + 1}, $${i * 4 + 2}, 'market_cancelled', 'pending', NOW())`)
+          .join(', ');
+        const params = bettors.rows.flatMap((r: { bettor_address: string }) => [r.bettor_address, id]);
+        await pool.query(
+          `INSERT INTO notification_jobs (bettor_address, market_id, job_type, status, created_at) VALUES ${values}`,
+          params,
+        );
+      }
+
+      result.succeeded.push(id);
+    } catch (err) {
+      result.failed.push({ id, reason: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  return result;
 }

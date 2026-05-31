@@ -1,4 +1,4 @@
-import { setDbAdapter, getMarkets, getMarketById, getMarketOdds, getPortfolioByAddress, getBetsByMarket } from '../../src/services/MarketService';
+import { setDbAdapter, getMarkets, getMarketById, getMarketOdds, getPortfolioByAddress, getBetsByMarket, simulateProjectedPayout } from '../../src/services/MarketService';
 import { AppError } from '../../src/utils/AppError';
 import type { Market } from '../../src/models/Market';
 import type { Bet } from '../../src/models/Bet';
@@ -35,6 +35,7 @@ function makeMarket(overrides: Partial<Market> = {}): Market {
     pool_draw: '0',
     total_pool: '0',
     fee_bps: 200,
+    lock_before_secs: 3600,
     resolved_at: null,
     oracle_used: null,
     created_at: new Date(),
@@ -156,5 +157,237 @@ describe('MarketService', () => {
   it('getBetsByMarket() returns empty array when no bets found', async () => {
     const bets = await getBetsByMarket('mkt-1');
     expect(bets).toEqual([]);
+  });
+
+  // 10 ────────────────────────────────────────────────────────────────────────
+  it('getMarkets() filters by fighter name (partial match)', async () => {
+    const market1 = makeMarket({ market_id: 'mkt-1', fighter_a: 'Floyd Mayweather', fighter_b: 'Manny Pacquiao' });
+    const market2 = makeMarket({ market_id: 'mkt-2', fighter_a: 'Canelo Alvarez', fighter_b: 'Gennady Golovkin' });
+    setDbAdapter({
+      findMarkets: jest.fn().mockResolvedValue([market1, market2]),
+      findMarketById: jest.fn(),
+      findBetsByAddress: jest.fn(),
+      findBetsByMarket: jest.fn(),
+      updateMarketStatus: jest.fn(),
+    });
+    const result = await getMarkets({ fighter: 'Mayweather' });
+    expect(result.total).toBe(1);
+    expect(result.markets[0].fighter_a).toBe('Floyd Mayweather');
+  });
+
+  // 11 ────────────────────────────────────────────────────────────────────────
+  it('getMarkets() filters by fighter name (case-insensitive)', async () => {
+    const market = makeMarket({ market_id: 'mkt-1', fighter_a: 'Floyd Mayweather', fighter_b: 'Manny Pacquiao' });
+    setDbAdapter({
+      findMarkets: jest.fn().mockResolvedValue([market]),
+      findMarketById: jest.fn(),
+      findBetsByAddress: jest.fn(),
+      findBetsByMarket: jest.fn(),
+      updateMarketStatus: jest.fn(),
+    });
+    const result = await getMarkets({ fighter: 'mayweather' });
+    expect(result.total).toBe(1);
+  });
+
+  // 12 ────────────────────────────────────────────────────────────────────────
+  it('getMarkets() filters by date range', async () => {
+    const market1 = makeMarket({ market_id: 'mkt-1', scheduled_at: new Date('2026-06-01T00:00:00Z') });
+    const market2 = makeMarket({ market_id: 'mkt-2', scheduled_at: new Date('2026-07-01T00:00:00Z') });
+    const market3 = makeMarket({ market_id: 'mkt-3', scheduled_at: new Date('2026-08-01T00:00:00Z') });
+    setDbAdapter({
+      findMarkets: jest.fn().mockResolvedValue([market1, market2, market3]),
+      findMarketById: jest.fn(),
+      findBetsByAddress: jest.fn(),
+      findBetsByMarket: jest.fn(),
+      updateMarketStatus: jest.fn(),
+    });
+    const result = await getMarkets({
+      dateFrom: new Date('2026-06-15T00:00:00Z'),
+      dateTo: new Date('2026-07-15T00:00:00Z'),
+    });
+    expect(result.total).toBe(1);
+    expect(result.markets[0].market_id).toBe('mkt-2');
+  });
+
+  // 13 ────────────────────────────────────────────────────────────────────────
+  it('simulateProjectedPayout() returns correct payout for fighter_a', async () => {
+    setDbAdapter({
+      findMarkets: jest.fn(),
+      findMarketById: jest.fn().mockResolvedValue(
+        makeMarket({
+          market_id: 'mkt-sim',
+          pool_a: '5000',
+          pool_b: '3000',
+          pool_draw: '2000',
+          total_pool: '10000',
+          fee_bps: 200,
+          status: 'open',
+        }),
+      ),
+      findBetsByAddress: jest.fn(),
+      findBetsByMarket: jest.fn(),
+      updateMarketStatus: jest.fn(),
+    });
+
+    // Bet 1000 stroops on fighter_a
+    // payout = (1000 * (10000 - 200)) / 5000 = (1000 * 9800) / 5000 = 1960
+    const result = await simulateProjectedPayout('mkt-sim', '1000', 'fighter_a');
+    expect(result.amount).toBe('1960');
+    expect(result.formatted_xlm).toBe(0.000196);
+  });
+
+  // 14 ────────────────────────────────────────────────────────────────────────
+  it('simulateProjectedPayout() returns correct payout for fighter_b', async () => {
+    setDbAdapter({
+      findMarkets: jest.fn(),
+      findMarketById: jest.fn().mockResolvedValue(
+        makeMarket({
+          market_id: 'mkt-sim',
+          pool_a: '5000',
+          pool_b: '3000',
+          pool_draw: '2000',
+          total_pool: '10000',
+          fee_bps: 200,
+          status: 'open',
+        }),
+      ),
+      findBetsByAddress: jest.fn(),
+      findBetsByMarket: jest.fn(),
+      updateMarketStatus: jest.fn(),
+    });
+
+    // Bet 1500 stroops on fighter_b
+    // payout = (1500 * (10000 - 200)) / 3000 = (1500 * 9800) / 3000 = 4900
+    const result = await simulateProjectedPayout('mkt-sim', '1500', 'fighter_b');
+    expect(result.amount).toBe('4900');
+    expect(result.formatted_xlm).toBe(0.00049);
+  });
+
+  // 15 ────────────────────────────────────────────────────────────────────────
+  it('simulateProjectedPayout() returns 0 for empty outcome pool', async () => {
+    setDbAdapter({
+      findMarkets: jest.fn(),
+      findMarketById: jest.fn().mockResolvedValue(
+        makeMarket({
+          market_id: 'mkt-empty',
+          pool_a: '0',
+          pool_b: '5000',
+          pool_draw: '0',
+          total_pool: '5000',
+          fee_bps: 200,
+          status: 'open',
+        }),
+      ),
+      findBetsByAddress: jest.fn(),
+      findBetsByMarket: jest.fn(),
+      updateMarketStatus: jest.fn(),
+    });
+
+    const result = await simulateProjectedPayout('mkt-empty', '1000', 'draw');
+    expect(result.amount).toBe('0');
+    expect(result.formatted_xlm).toBe(0);
+  });
+
+  // 16 ────────────────────────────────────────────────────────────────────────
+  it('simulateProjectedPayout() returns 0 for cancelled market', async () => {
+    setDbAdapter({
+      findMarkets: jest.fn(),
+      findMarketById: jest.fn().mockResolvedValue(
+        makeMarket({
+          market_id: 'mkt-cancelled',
+          status: 'cancelled',
+        }),
+      ),
+      findBetsByAddress: jest.fn(),
+      findBetsByMarket: jest.fn(),
+      updateMarketStatus: jest.fn(),
+    });
+
+    const result = await simulateProjectedPayout('mkt-cancelled', '1000', 'fighter_a');
+    expect(result.amount).toBe('0');
+    expect(result.formatted_xlm).toBe(0);
+  });
+
+  // 17 ────────────────────────────────────────────────────────────────────────
+  it('simulateProjectedPayout() throws 404 for unknown market', async () => {
+    setDbAdapter({
+      findMarkets: jest.fn(),
+      findMarketById: jest.fn().mockResolvedValue(null),
+      findBetsByAddress: jest.fn(),
+      findBetsByMarket: jest.fn(),
+      updateMarketStatus: jest.fn(),
+    });
+
+    await expect(
+      simulateProjectedPayout('unknown', '1000', 'fighter_a'),
+    ).rejects.toMatchObject({ statusCode: 404 });
+  });
+
+  // 18 ────────────────────────────────────────────────────────────────────────
+  it('simulateProjectedPayout() returns 0 for zero or negative amount', async () => {
+    setDbAdapter({
+      findMarkets: jest.fn(),
+      findMarketById: jest.fn().mockResolvedValue(
+        makeMarket({
+          market_id: 'mkt-zero',
+          pool_a: '5000',
+          pool_b: '3000',
+          pool_draw: '2000',
+          total_pool: '10000',
+          fee_bps: 200,
+          status: 'open',
+        }),
+      ),
+      findBetsByAddress: jest.fn(),
+      findBetsByMarket: jest.fn(),
+      updateMarketStatus: jest.fn(),
+    });
+
+    const result = await simulateProjectedPayout('mkt-zero', '0', 'fighter_a');
+    expect(result.amount).toBe('0');
+    expect(result.formatted_xlm).toBe(0);
+  });
+
+  // 19 ────────────────────────────────────────────────────────────────────────
+  it('simulateProjectedPayout() returns correct payout for draw outcome', async () => {
+    setDbAdapter({
+      findMarkets: jest.fn(),
+      findMarketById: jest.fn().mockResolvedValue(
+        makeMarket({
+          market_id: 'mkt-draw',
+          pool_a: '7000',
+          pool_b: '2000',
+          pool_draw: '1000',
+          total_pool: '10000',
+          fee_bps: 100, // 1% fee
+          status: 'locked',
+        }),
+      ),
+      findBetsByAddress: jest.fn(),
+      findBetsByMarket: jest.fn(),
+      updateMarketStatus: jest.fn(),
+    });
+
+    // Bet 500 stroops on draw
+    // payout = (500 * (10000 - 100)) / 1000 = (500 * 9900) / 1000 = 4950
+    const result = await simulateProjectedPayout('mkt-draw', '500', 'draw');
+    expect(result.amount).toBe('4950');
+    expect(result.formatted_xlm).toBe(0.000495);
+  });
+
+  // 20 ────────────────────────────────────────────────────────────────────────
+  it('getMarkets() sorts by scheduled_at DESC (most recent first)', async () => {
+    const market1 = makeMarket({ market_id: 'mkt-1', scheduled_at: new Date('2026-06-01T00:00:00Z') });
+    const market2 = makeMarket({ market_id: 'mkt-2', scheduled_at: new Date('2026-07-01T00:00:00Z') });
+    setDbAdapter({
+      findMarkets: jest.fn().mockResolvedValue([market1, market2]),
+      findMarketById: jest.fn(),
+      findBetsByAddress: jest.fn(),
+      findBetsByMarket: jest.fn(),
+      updateMarketStatus: jest.fn(),
+    });
+    const result = await getMarkets();
+    expect(result.markets[0].market_id).toBe('mkt-2'); // Most recent first
+    expect(result.markets[1].market_id).toBe('mkt-1');
   });
 });

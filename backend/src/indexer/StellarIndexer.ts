@@ -10,14 +10,16 @@
 // ============================================================
 
 import { pool } from '../config/db';
-import { rpc } from '@stellar/stellar-sdk';
+import { rpc, Address, xdr } from '@stellar/stellar-sdk';
+import { subscribeToContractEvents, fetchHistoricalEvents } from '../services/StellarService';
+import { cacheDeletePattern } from '../services/cache.service';
 
 // Raw event shape returned by Stellar RPC / Horizon
 export interface RawStellarEvent {
   contract_address: string;
   event_type: string;
   topics: string[];
-  data: string; // XDR-encoded event data
+  data: string; // JSON-encoded flat event payload
   ledger_sequence: number;
   ledger_close_time: string;
   tx_hash: string;
@@ -35,9 +37,50 @@ export async function startIndexer(): Promise<void> {
 
   console.log(`[Indexer] Starting from ledger ${lastProcessed}`);
 
+  // Load checkpoint and backfill if needed
+  const checkpoint = await loadCheckpoint();
+  if (checkpoint && checkpoint > lastProcessed) {
+    console.log(`[Indexer] Backfilling from ledger ${lastProcessed + 1} to ${checkpoint}`);
+    await backfillFromLedger(lastProcessed + 1, checkpoint);
+    lastProcessed = checkpoint;
+  }
+
+  // Subscribe to real-time events
+  console.log(`[Indexer] Starting real-time subscription from ledger ${lastProcessed}`);
+  const unsubscribe = subscribeToContractEvents(FACTORY_CONTRACT, async (event: unknown) => {
+    try {
+      const eventData = event as Record<string, unknown>;
+      const rawEvent: RawStellarEvent = {
+        contract_address: (eventData.contract_address as string) || FACTORY_CONTRACT,
+        event_type: (eventData.type as string) || 'unknown',
+        topics: (eventData.topics as string[]) || [],
+        data: JSON.stringify(event),
+        ledger_sequence: (eventData.ledger as number) || 0,
+        ledger_close_time: (eventData.ledger_close_time as string) || new Date().toISOString(),
+        tx_hash: (eventData.tx_hash as string) || '',
+      };
+      await processEvent(rawEvent);
+    } catch (err) {
+      console.error('[Indexer] Error processing real-time event:', err);
+    }
+  });
+
+  // Handle graceful shutdown
+  process.on('SIGTERM', () => {
+    console.log('[Indexer] SIGTERM received, shutting down gracefully');
+    unsubscribe();
+    process.exit(0);
+  });
+
+  process.on('SIGINT', () => {
+    console.log('[Indexer] SIGINT received, shutting down gracefully');
+    unsubscribe();
+    process.exit(0);
+  });
+
+  // Keep polling for new ledgers as fallback
   while (true) {
     try {
-      // Get the latest ledger sequence from Stellar RPC
       const latestLedgerResponse = await server.getLatestLedger();
       const latestLedger = latestLedgerResponse.sequence;
 
@@ -48,7 +91,6 @@ export async function startIndexer(): Promise<void> {
           lastProcessed = seq;
         }
       } else {
-        // No new ledgers, sleep
         await new Promise(resolve => setTimeout(resolve, pollInterval));
       }
     } catch (err) {
@@ -57,6 +99,154 @@ export async function startIndexer(): Promise<void> {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// ScVal helpers
+// ---------------------------------------------------------------------------
+
+/** Safely extract a string value from an xdr.ScVal. */
+function scvToString(scv: xdr.ScVal): string {
+  const s = scv as any;
+  const arm: string = s.arm();
+  switch (arm) {
+    case 'sym':   return s.sym().toString();
+    case 'str':   return s.str().toString();
+    case 'u32':
+    case 'i32':
+    case 'u64':
+    case 'i64':
+    case 'b':     return String(s[arm]());
+    case 'address': return Address.fromScVal(scv).toString();
+    case 'void':  return '';
+    default: {
+      if (arm === 'i128' || arm === 'u128') {
+        const parts = s[arm]();
+        const hi = BigInt(parts._attributes?._value ?? 0);
+        const lo = BigInt(parts._maxDepth?._value ?? 0);
+        const signedHi = arm === 'i128' && hi >= 2n ** 63n ? hi - 2n ** 64n : hi;
+        return ((signedHi << 64n) + lo).toString();
+      }
+      const val = s[arm]?.();
+      return val != null ? String(val) : scv.toString();
+    }
+  }
+}
+
+/** Recursively convert an xdr.ScVal to a plain JS value. */
+function scvToNative(scv: xdr.ScVal): unknown {
+  const s = scv as any;
+  const arm: string = s.arm();
+  switch (arm) {
+    case 'sym':   return s.sym().toString();
+    case 'str':   return s.str().toString();
+    case 'b':     return s.b();
+    case 'u32':   return s.u32();
+    case 'i32':   return s.i32();
+    case 'u64':   return String(s.u64());
+    case 'i64':   return String(s.i64());
+    case 'address': return Address.fromScVal(scv).toString();
+    case 'void':  return null;
+    case 'vec':   return s.vec().map(scvToNative);
+    case 'map': {
+      const result: Record<string, unknown> = {};
+      s.map().forEach((entry: any) => {
+        result[String(scvToNative(entry.key()))] = scvToNative(entry.val());
+      });
+      return result;
+    }
+    case 'i128':
+    case 'u128': {
+      const parts = s[arm]();
+      const hi = BigInt(parts._attributes?._value ?? 0);
+      const lo = BigInt(parts._maxDepth?._value ?? 0);
+      const signedHi = arm === 'i128' && hi >= 2n ** 63n ? hi - 2n ** 64n : hi;
+      return ((signedHi << 64n) + lo).toString();
+    }
+    default:      return scv.toString();
+  }
+}
+
+/**
+ * Map of Soroban event type (snake_case) → flat JSON field selectors.
+ *
+ * Each entry lists the fields expected by the handler and how to extract them
+ * from the ScVal topics/value. The selectors use dot‑separated paths:
+ *   "topic.1"       → topic at index 1 (market_id)
+ *   "data.0"        → data array at index 0 (first field of the tuple/struct)
+ *   "data.to_string" → data as a plain string (not an array)
+ */
+const EVENT_FIELD_MAP: Record<string, Array<[string, string]>> = {
+  market_created: [
+    ['market_id',       'topic.1'],
+    ['contract_address','data.0'],
+    ['match_id',        'data.1'],
+  ],
+  market_locked: [
+    ['market_id', 'topic.1'],
+  ],
+  market_resolved: [
+    ['market_id',     'topic.1'],
+    ['outcome',       'data.0'],
+    ['oracle_address','data.1'],
+  ],
+  bet_placed: [
+    ['market_id',       'topic.1'],
+    ['bettor_address',  'data.0'],
+    ['side',            'data.2'],
+    ['amount',          'data.3'],
+    ['placed_at',       'data.4'],
+    ['claimed',         'data.5'],
+  ],
+  winnings_claimed: [
+    ['market_id',      'topic.1'],
+    ['bettor_address', 'data.0'],
+    ['payout',         'data.2'],
+  ],
+  refund_claimed: [
+    ['market_id',       'topic.1'],
+    ['bettor_address',  'data.0'],
+    ['refund_amount',   'data.1'],
+  ],
+  market_cancelled: [
+    ['market_id', 'topic.1'],
+  ],
+};
+
+/**
+ * Build a flat JSON record from ScVal topics and value for a given event type.
+ *
+ * The returned record is then JSON.stringify'd into RawStellarEvent.data
+ * so that existing handlers (which call parsePayload) can read by field name.
+ */
+function buildEventPayload(
+  eventType: string,
+  topics: xdr.ScVal[],
+  value: xdr.ScVal,
+): Record<string, unknown> {
+  const record: Record<string, unknown> = {};
+  const fields = EVENT_FIELD_MAP[eventType];
+  if (!fields) return record; // unknown event → empty record
+
+  // Decode the data value (mostly a Vec or single value)
+  const nativeData = scvToNative(value) as unknown[] | string | null;
+
+  for (const [fieldName, selector] of fields) {
+    if (selector === 'topic.1') {
+      record[fieldName] = topics[1] ? scvToString(topics[1]) : '';
+    } else if (selector.startsWith('data.')) {
+      const idx = parseInt(selector.slice(5), 10);
+      record[fieldName] = Array.isArray(nativeData) ? String(nativeData[idx] ?? '') : '';
+    } else if (selector === 'data.to_string') {
+      record[fieldName] = typeof nativeData === 'string' ? nativeData : String(nativeData ?? '');
+    }
+  }
+
+  return record;
+}
+
+// ---------------------------------------------------------------------------
+// Ledger processing
+// ---------------------------------------------------------------------------
 
 export async function processLedger(ledger_sequence: number): Promise<void> {
   try {
@@ -81,11 +271,18 @@ export async function processLedger(ledger_sequence: number): Promise<void> {
     for (const event of response.events) {
       const contractId = typeof event.contractId === 'string' ? event.contractId : event.contractId?.toString() || '';
 
+      // Properly extract event type from ScVal Symbol topic
+      const eventType = (event.topic[0] as any)?.sym()?.toString() || 'unknown';
+
+      // Build a flat JSON record from ScVal topics + value
+      const payload = buildEventPayload(eventType, event.topic, event.value);
+      const data = JSON.stringify(payload);
+
       const rawEvent: RawStellarEvent = {
         contract_address: contractId,
-        event_type: event.topic[0]?.toString() || 'unknown',
-        topics: event.topic.map(t => t.toString()),
-        data: JSON.stringify(event.value),
+        event_type: eventType,
+        topics: event.topic.map((t: any) => scvToString(t)),
+        data,
         ledger_sequence: event.ledger,
         ledger_close_time: event.ledgerClosedAt,
         tx_hash: event.txHash
@@ -124,18 +321,20 @@ export async function processEvent(event: RawStellarEvent): Promise<void> {
   try {
     const eventType = event.event_type;
 
-    if (eventType === 'MarketCreated') {
+    if (eventType === 'market_created') {
       await handleMarketCreated(event);
-    } else if (eventType === 'BetPlaced') {
+    } else if (eventType === 'bet_placed') {
       await handleBetPlaced(event);
-    } else if (eventType === 'MarketLocked') {
+    } else if (eventType === 'market_locked') {
       await handleMarketLocked(event);
-    } else if (eventType === 'MarketResolved') {
+    } else if (eventType === 'market_resolved') {
       await handleMarketResolved(event);
-    } else if (eventType === 'MarketCancelled') {
+    } else if (eventType === 'market_cancelled') {
       await handleMarketCancelled(event);
-    } else if (eventType === 'WinningsClaimed') {
+    } else if (eventType === 'winnings_claimed') {
       await handleWinningsClaimed(event);
+    } else if (eventType === 'refund_claimed') {
+      await handleRefundClaimed(event);
     }
   } catch (err) {
     console.error(`Error processing event ${event.tx_hash}:`, err);
@@ -156,27 +355,54 @@ function parsePayload(data: string): Record<string, unknown> {
 
 export async function handleMarketCreated(event: RawStellarEvent): Promise<void> {
   const p = parsePayload(event.data);
-  await pool.query(
-    `INSERT INTO markets
-       (market_id, contract_address, match_id, fighter_a, fighter_b,
-        weight_class, title_fight, venue, scheduled_at, fee_bps, status, ledger_sequence)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-     ON CONFLICT (market_id) DO NOTHING`,
-    [
-      p.market_id,
-      event.contract_address,
-      p.match_id ?? '',
-      p.fighter_a ?? '',
-      p.fighter_b ?? '',
-      p.weight_class ?? '',
-      p.title_fight ?? false,
-      p.venue ?? '',
-      p.scheduled_at ?? new Date(),
-      p.fee_bps ?? 200,
-      'open',
-      event.ledger_sequence,
-    ],
-  );
+  
+  try {
+    // Parse event payload into MarketCreatedEvent type
+    const marketData = {
+      market_id: p.market_id,
+      contract_address: event.contract_address,
+      match_id: p.match_id ?? '',
+      fighter_a: p.fighter_a ?? '',
+      fighter_b: p.fighter_b ?? '',
+      weight_class: p.weight_class ?? '',
+      title_fight: p.title_fight ?? false,
+      venue: p.venue ?? '',
+      scheduled_at: p.scheduled_at ?? new Date(),
+      fee_bps: p.fee_bps ?? 200,
+      lock_before_secs: p.lock_before_secs ?? 3600,
+      status: 'open',
+      ledger_sequence: event.ledger_sequence,
+    };
+
+    // Idempotent: does not throw if market already exists
+    await pool.query(
+      `INSERT INTO markets
+         (market_id, contract_address, match_id, fighter_a, fighter_b,
+          weight_class, title_fight, venue, scheduled_at, fee_bps, lock_before_secs, status, ledger_sequence)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+       ON CONFLICT (market_id) DO NOTHING`,
+      [
+        marketData.market_id,
+        marketData.contract_address,
+        marketData.match_id,
+        marketData.fighter_a,
+        marketData.fighter_b,
+        marketData.weight_class,
+        marketData.title_fight,
+        marketData.venue,
+        marketData.scheduled_at,
+        marketData.fee_bps,
+        marketData.lock_before_secs,
+        marketData.status,
+        marketData.ledger_sequence,
+      ],
+    );
+
+    console.log(`[Indexer] Market created: ${marketData.market_id}`);
+  } catch (err) {
+    console.error(`[Indexer] Error handling MarketCreated event:`, err);
+    throw err;
+  }
 }
 
 export async function handleBetPlaced(event: RawStellarEvent): Promise<void> {
@@ -232,12 +458,28 @@ export async function handleMarketResolved(event: RawStellarEvent): Promise<void
   try {
     await client.query('BEGIN');
 
-    // Update market status and outcome
+    // Update market status, winning_outcome, and resolved_at
     await client.query(
       `UPDATE markets
           SET status = 'resolved', outcome = $1, resolved_at = $2, oracle_used = $3, updated_at = NOW()
         WHERE market_id = $4`,
       [p.outcome, event.ledger_close_time, p.oracle_address ?? null, p.market_id],
+    );
+
+    // Insert OracleReport record
+    await client.query(
+      `INSERT INTO oracle_reports
+         (match_id, oracle_address, outcome, reported_at, signature, accepted, tx_hash)
+       VALUES ($1, $2, $3, $4, $5, TRUE, $6)
+       ON CONFLICT DO NOTHING`,
+      [
+        p.match_id ?? '',
+        p.oracle_address ?? '',
+        p.outcome ?? '',
+        event.ledger_close_time,
+        p.signature ?? '',
+        event.tx_hash,
+      ],
     );
 
     // Get all unique bettors for this market
@@ -262,14 +504,46 @@ export async function handleMarketResolved(event: RawStellarEvent): Promise<void
   } finally {
     client.release();
   }
+
+  // Invalidate all Redis cache keys for this market
+  await cacheDeletePattern(`market:${p.market_id}*`);
+  await cacheDeletePattern(`markets:*`);
 }
 
 export async function handleMarketCancelled(event: RawStellarEvent): Promise<void> {
   const p = parsePayload(event.data);
-  await pool.query(
-    `UPDATE markets SET status = 'cancelled', updated_at = NOW() WHERE market_id = $1`,
-    [p.market_id],
-  );
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Update market status
+    await client.query(
+      `UPDATE markets SET status = 'cancelled', updated_at = NOW() WHERE market_id = $1`,
+      [p.market_id],
+    );
+
+    // Get all unique bettors for this market
+    const { rows: bettors } = await client.query(
+      `SELECT DISTINCT bettor_address FROM bets WHERE market_id = $1`,
+      [p.market_id]
+    );
+
+    // Enqueue notification job for each bettor
+    for (const bettor of bettors) {
+      await client.query(
+        `INSERT INTO notification_jobs (bettor_address, market_id, job_type, status, created_at)
+         VALUES ($1, $2, $3, $4, NOW())`,
+        [bettor.bettor_address, p.market_id, 'market_cancelled', 'pending']
+      );
+    }
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 export async function handleWinningsClaimed(event: RawStellarEvent): Promise<void> {
@@ -279,6 +553,16 @@ export async function handleWinningsClaimed(event: RawStellarEvent): Promise<voi
         SET claimed = TRUE, claimed_at = NOW(), payout = $1
       WHERE market_id = $2 AND bettor_address = $3`,
     [p.payout ?? null, p.market_id, p.bettor_address],
+  );
+}
+
+export async function handleRefundClaimed(event: RawStellarEvent): Promise<void> {
+  const p = parsePayload(event.data);
+  await pool.query(
+    `UPDATE bets
+        SET claimed = TRUE, claimed_at = NOW(), payout = $1
+      WHERE market_id = $2 AND bettor_address = $3`,
+    [p.refund_amount ?? null, p.market_id, p.bettor_address],
   );
 }
 
@@ -342,4 +626,34 @@ export async function backfillLedgerRange(
   }
 
   console.log(`[Backfill] Complete — ${processed} ledgers processed.`);
+}
+
+/**
+ * Loads the checkpoint from the database.
+ * Returns the last processed ledger, or null if no checkpoint exists.
+ */
+export async function loadCheckpoint(): Promise<number | null> {
+  const { rows } = await pool.query(
+    `SELECT last_processed_ledger FROM indexer_checkpoints ORDER BY id DESC LIMIT 1`,
+  );
+  return rows[0]?.last_processed_ledger ?? null;
+}
+
+/**
+ * Backfills from a given ledger to the latest ledger.
+ * Uses fetchHistoricalEvents to get all events and processes them.
+ */
+export async function backfillFromLedger(fromLedger: number, toLedger?: number): Promise<void> {
+  console.log(`[Indexer] Backfilling from ledger ${fromLedger}${toLedger ? ` to ${toLedger}` : ''}`);
+  
+  const events = await fetchHistoricalEvents(fromLedger, toLedger);
+  console.log(`[Indexer] Fetched ${events.length} historical events`);
+
+  for (const event of events) {
+    await processEvent(event);
+  }
+
+  if (toLedger) {
+    await saveCheckpoint(toLedger);
+  }
 }

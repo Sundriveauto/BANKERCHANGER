@@ -47,7 +47,7 @@ pub enum OracleRole {
 
 /// All identifying details about a scheduled boxing match.
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FightDetails {
     /// Unique fight identifier — e.g. "FURY-USYK-2025-MAY"
     pub match_id: String,
@@ -67,7 +67,7 @@ pub struct FightDetails {
 
 /// Configuration parameters for a single market.
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MarketConfig {
     /// Minimum bet in stroops (1 XLM = 10_000_000 stroops)
     pub min_bet: i128,
@@ -81,9 +81,25 @@ pub struct MarketConfig {
     pub resolution_window: u64,
 }
 
+/// Configuration passed to MarketFactory on initialization.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FactoryConfig {
+    /// Minimum bet in stroops for newly created markets (1 XLM = 10_000_000 stroops)
+    pub default_min_bet: i128,
+    /// Maximum single bet in stroops for newly created markets
+    pub default_max_bet: i128,
+    /// Platform fee in basis points (200 = 2%) for newly created markets
+    pub default_fee_bps: u32,
+    /// Seconds before scheduled_at to stop accepting bets (new markets)
+    pub default_lock_before_secs: u64,
+    /// Seconds after scheduled_at within which oracle must resolve (new markets)
+    pub default_resolution_window: u64,
+}
+
 /// Global configuration for the prediction market system.
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     /// Dispute window duration in seconds (minimum 3600 = 1 hour)
     pub dispute_window_secs: u64,

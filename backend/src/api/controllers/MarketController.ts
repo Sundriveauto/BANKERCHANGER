@@ -9,6 +9,7 @@ import { StrKey } from '@stellar/stellar-sdk';
 import { AppError } from '../../utils/AppError';
 import { validateQuery } from '../middleware/validate';
 import * as MarketService from '../../services/MarketService';
+import * as OracleService from '../../oracle/OracleService';
 
 // ---------------------------------------------------------------------------
 // Issue #18 — listMarkets
@@ -18,11 +19,12 @@ const VALID_STATUSES = ['open', 'locked', 'resolved', 'cancelled', 'disputed'] a
 
 const listMarketsQuerySchema = z.object({
   status: z
-    .enum(VALID_STATUSES, {
-      errorMap: () => ({ message: `status must be one of: ${VALID_STATUSES.join(', ')}` }),
-    })
+    .enum(VALID_STATUSES)
     .optional(),
   weight_class: z.string().min(1).optional(),
+  fighter: z.string().min(1).optional(),
+  dateFrom: z.string().datetime().optional().transform(v => v ? new Date(v) : undefined),
+  dateTo: z.string().datetime().optional().transform(v => v ? new Date(v) : undefined),
   page: z.coerce.number().int().min(1, { message: 'page must be an integer ≥ 1' }).default(1),
   limit: z.coerce
     .number()
@@ -44,9 +46,9 @@ export const listMarketsValidation = validateQuery(listMarketsQuerySchema);
  */
 export async function listMarkets(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
-    const { status, weight_class, page, limit } = req.query as z.infer<typeof listMarketsQuerySchema>;
+    const { status, weight_class, fighter, dateFrom, dateTo, page, limit } = req.query as z.infer<typeof listMarketsQuerySchema>;
     const { markets, total } = await MarketService.getMarkets(
-      { status, weight_class },
+      { status, weight_class, fighter, dateFrom, dateTo },
       { page, limit },
     );
     res.status(200).json({ markets, total, page, limit });
@@ -68,12 +70,12 @@ export async function getMarket(
 ): Promise<void> {
   try {
     const { market_id } = req.params;
+    if (!/^\d+$/.test(market_id)) {
+      throw AppError.badRequest('marketId must be a valid numeric string');
+    }
     const market = await MarketService.getMarketById(market_id);
     res.status(200).json(market);
   } catch (err) {
-    if (err instanceof AppError && err.statusCode === 404) {
-      return next(err);
-    }
     next(err);
   }
 }
@@ -126,6 +128,82 @@ export async function getMarketStats(req: Request, res: Response, next: NextFunc
     const stats = await MarketService.getMarketStats(market_id);
     res.status(200).json(stats);
   } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * GET /api/markets/:market_id/odds
+ *
+ * Returns parimutuel odds for all three outcomes (fighter_a, fighter_b, draw).
+ * Each outcome includes the multiplier (net payout per unit staked) and
+ * implied probability (as a percentage).
+ * Responds 404 if market not found, 200 with AllOutcomeOdds.
+ */
+const VALID_OUTCOMES = ['fighter_a', 'fighter_b', 'draw'] as const;
+
+export async function getMarketOdds(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const { market_id } = req.params;
+    const outcome = req.query.outcome as string | undefined;
+
+    if (outcome && !VALID_OUTCOMES.includes(outcome as typeof VALID_OUTCOMES[number])) {
+      res.status(400).json({ error: `Invalid outcome. Must be one of: ${VALID_OUTCOMES.join(', ')}` });
+      return;
+    }
+
+    if (outcome) {
+      const odds = await MarketService.calculateSingleOutcomeOdds(market_id, outcome as 'fighter_a' | 'fighter_b' | 'draw');
+      res.status(200).json(odds);
+    } else {
+      const odds = await MarketService.calculateOutcomeOdds(market_id);
+      res.status(200).json(odds);
+    }
+  } catch (err) {
+    if (err instanceof AppError && err.statusCode === 404) {
+      return next(err);
+    }
+    next(err);
+  }
+}
+
+const simulateQuerySchema = z.object({
+  amount: z.coerce.number().positive({ message: 'amount must be a positive number' }),
+  outcome: z.enum(VALID_OUTCOMES),
+});
+
+/**
+ * GET /api/markets/:market_id/simulate
+ * Query params: amount (stroops, positive number), outcome (fighter_a | fighter_b | draw)
+ *
+ * Returns the projected payout for a hypothetical bet using parimutuel formula.
+ * Responds 200 with { amount, formatted_xlm }.
+ */
+export const simulatePayoutValidation = validateQuery(simulateQuerySchema);
+
+export async function simulatePayout(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const { market_id } = req.params;
+    const { amount, outcome } = req.query as unknown as { amount: number; outcome: 'fighter_a' | 'fighter_b' | 'draw' };
+
+    const payout = await MarketService.simulateProjectedPayout(
+      market_id,
+      String(amount),
+      outcome,
+    );
+    res.status(200).json(payout);
+  } catch (err) {
+    if (err instanceof AppError && err.statusCode === 404) {
+      return next(err);
+    }
     next(err);
   }
 }
@@ -203,6 +281,56 @@ export async function getPlatformStats(req: Request, res: Response, next: NextFu
   try {
     const stats = await MarketService.getPlatformStats();
     res.status(200).json(stats);
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #745 — resolveMarket (admin)
+// ---------------------------------------------------------------------------
+
+const VALID_OUTCOMES = ['fighter_a', 'fighter_b', 'draw', 'no_contest'] as const;
+
+const resolveMarketBodySchema = z.object({
+  winning_outcome: z.enum(VALID_OUTCOMES, {
+    errorMap: () => ({ message: `winning_outcome must be one of: ${VALID_OUTCOMES.join(', ')}` }),
+  }),
+});
+
+/**
+ * POST /api/markets/:market_id/resolve
+ * Protected by requireAdminJwt middleware.
+ *
+ * Resolves a market with the given winning_outcome.
+ * Returns 409 if market is already resolved.
+ * Returns 200 with updated market on success.
+ */
+export async function resolveMarket(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const { market_id } = req.params;
+
+    const parsed = resolveMarketBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      const errors = parsed.error.issues.map((e) => ({ field: e.path.join('.'), message: e.message }));
+      res.status(400).json({ errors });
+      return;
+    }
+
+    const { winning_outcome } = parsed.data;
+
+    const market = await MarketService.db().findMarketById(market_id);
+    if (!market) throw AppError.notFound(`Market not found: ${market_id}`);
+
+    if (market.status === 'resolved') {
+      res.status(409).json({ error: 'Market is already resolved' });
+      return;
+    }
+
+    await OracleService.submitFightResult(market.match_id, winning_outcome);
+
+    const updated = await MarketService.db().findMarketById(market_id);
+    res.status(200).json(updated);
   } catch (err) {
     next(err);
   }
